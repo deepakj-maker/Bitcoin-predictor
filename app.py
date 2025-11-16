@@ -111,10 +111,25 @@ BINANCE_24H = "https://api.binance.com/api/v3/ticker/24hr"
 COINGECKO_RANGE = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range"
 
 from requests.adapters import HTTPAdapter, Retry
-def _make_requests_session(retries=3, backoff_factor=0.3, status_forcelist=(429,500,502,503,504,451)):
+
+def _make_requests_session(retries=3, backoff_factor=0.3, status_forcelist=(429,500,502,503,504)):
+    """
+    Create a requests.Session with Retry configured.
+    NOTE: intentionally exclude 451 from retry list so we don't keep retrying
+    'Unavailable For Legal Reasons' responses — those should immediately fall back.
+    """
     s = requests.Session()
-    retries = Retry(total=retries, backoff_factor=backoff_factor, status_forcelist=status_forcelist, allowed_methods=["GET"])
-    s.mount("https://", HTTPAdapter(max_retries=retries))
+    retry = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        allowed_methods=frozenset(["GET", "HEAD"])
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    # set a sensible user agent so some providers don't block us
+    s.headers.update({"User-Agent": "real-time-btc-predictor/1.0 (+https://example.com)"})
     return s
 
 def now_ms():
@@ -125,41 +140,64 @@ def ms_to_s(ms):
 # Rate-limit aware CoinGecko fetcher (retries, respects Retry-After)
 def fetch_klines_coingecko(symbol="BTCUSDT", interval="1m", start_time_ms=None, end_time_ms=None, max_attempts=5):
     """
-    Rate-limit-aware CoinGecko range fetcher.
-    Retries on 429 with exponential backoff and honors Retry-After header.
-    Returns DataFrame with open_time, open, high, low, close, volume or empty DF on hard failure.
+    Rate-limit-aware CoinGecko range fetcher (uses a requests.Session).
+    - Exits immediately on HTTP 451 (legal block) and returns empty DF so the app can use other fallbacks.
+    - Retries on 429 respecting Retry-After header.
+    - Caps backoff wait to avoid extremely long sleeps.
     """
+    session = _make_requests_session(retries=3, backoff_factor=0.5)
     now = now_ms()
     if end_time_ms is None:
         end_time_ms = now
     end_s = ms_to_s(min(end_time_ms, now))
     if start_time_ms is None:
-        start_s = end_s - 7*24*3600  # default 7 days
+        start_s = end_s - 7*24*3600  # 7 days default
     else:
         start_s = ms_to_s(start_time_ms)
 
-    params = {"vs_currency": "usd", "from": int(start_s), "to": int(end_s)}
     url = COINGECKO_RANGE
+    params = {"vs_currency": "usd", "from": int(start_s), "to": int(end_s)}
     attempt = 0
     backoff = 1.0
+    MAX_BACKOFF = 8.0  # cap backoff so sleeps don't grow unbounded
+
     while attempt < max_attempts:
         attempt += 1
         try:
-            r = requests.get(url, params=params, timeout=20)
+            r = session.get(url, params=params, timeout=20)
+            # If CoinGecko returns 451 -> legal block, don't retry, fall back immediately
+            if r.status_code == 451:
+                st.warning(f"CoinGecko returned HTTP 451 (unavailable for legal reasons). Not retrying; falling back (attempt {attempt}/{max_attempts}).")
+                df_empty = pd.DataFrame(columns=["open_time","open","high","low","close","volume"])
+                df_empty._source = "coingecko"
+                return df_empty
+
             if r.status_code == 429:
+                # Rate limited: honor Retry-After if present, else small backoff
                 ra = r.headers.get("Retry-After")
                 if ra:
                     try:
-                        wait = float(ra)
+                        wait = min(float(ra), MAX_BACKOFF)
                     except Exception:
-                        wait = backoff
+                        wait = min(backoff, MAX_BACKOFF)
                 else:
-                    wait = backoff
+                    wait = min(backoff, MAX_BACKOFF)
                 st.warning(f"CoinGecko 429 rate limit. Sleeping {wait:.1f}s (attempt {attempt}/{max_attempts})")
                 time.sleep(wait)
-                backoff *= 2.0
+                backoff = min(backoff * 2.0, MAX_BACKOFF)
                 continue
-            r.raise_for_status()
+
+            # For other non-200 statuses, treat as hard failure and return empty to trigger Binance fallback upstream
+            if r.status_code != 200:
+                try:
+                    msg = r.json()
+                except Exception:
+                    msg = r.text[:400]
+                st.warning(f"CoinGecko request failed (status {r.status_code}). Server message: {msg}")
+                df_empty = pd.DataFrame(columns=["open_time","open","high","low","close","volume"])
+                df_empty._source = "coingecko"
+                return df_empty
+
             j = r.json()
             prices = j.get("prices", [])
             volumes = j.get("total_volumes", [])
@@ -167,11 +205,12 @@ def fetch_klines_coingecko(symbol="BTCUSDT", interval="1m", start_time_ms=None, 
                 df_empty = pd.DataFrame(columns=["open_time","open","high","low","close","volume"])
                 df_empty._source = "coingecko"
                 return df_empty
+
             dfp = pd.DataFrame(prices, columns=["ts_ms","price"])
             dfv = pd.DataFrame(volumes, columns=["ts_ms","volume"]) if volumes else None
             dfp["open_time"] = pd.to_datetime(dfp["ts_ms"], unit="ms")
             dfp["open"] = dfp["price"]; dfp["high"] = dfp["price"]; dfp["low"] = dfp["price"]; dfp["close"] = dfp["price"]
-            if dfv is not None:
+            if dfv is not None and not dfv.empty:
                 df = pd.merge_asof(dfp.sort_values("ts_ms"), dfv.sort_values("ts_ms"), on="ts_ms", direction="nearest")
                 df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
             else:
@@ -180,10 +219,12 @@ def fetch_klines_coingecko(symbol="BTCUSDT", interval="1m", start_time_ms=None, 
             df = df[["open_time","open","high","low","close","volume"]].reset_index(drop=True)
             df._source = "coingecko"
             return df
+
         except requests.RequestException as e:
-            st.warning(f"CoinGecko request error on attempt {attempt}: {e}")
-            time.sleep(backoff)
-            backoff *= 2.0
+            # Network error — retry a few times, then return empty DF
+            st.warning(f"CoinGecko network error on attempt {attempt}: {e}. Sleeping {min(backoff, MAX_BACKOFF):.1f}s before retry.")
+            time.sleep(min(backoff, MAX_BACKOFF))
+            backoff = min(backoff * 2.0, MAX_BACKOFF)
             continue
         except Exception as e:
             st.error(f"Unexpected CoinGecko parsing error: {e}")
@@ -191,7 +232,8 @@ def fetch_klines_coingecko(symbol="BTCUSDT", interval="1m", start_time_ms=None, 
             df_err._source = "coingecko"
             return df_err
 
-    st.warning("CoinGecko fallback exhausted retries (429). Returning empty DataFrame — the app will try other fallbacks if available.")
+    # exhausted attempts
+    st.warning("CoinGecko fallback exhausted retries. Returning empty DataFrame so other fallbacks can be used.")
     df_empty = pd.DataFrame(columns=["open_time","open","high","low","close","volume"])
     df_empty._source = "coingecko"
     return df_empty
@@ -276,21 +318,23 @@ def fetch_klines_resilient(symbol="BTCUSDT", interval="1m", limit=500, start_tim
     return df
 
 def fetch_current_price(symbol="BTCUSDT"):
+    session = _make_requests_session(retries=2, backoff_factor=0.2)
     try:
-        r = requests.get(BINANCE_PRICE, params={"symbol":symbol}, timeout=5)
+        r = session.get(BINANCE_PRICE, params={"symbol":symbol}, timeout=5)
         r.raise_for_status()
         return float(r.json()["price"])
     except Exception:
         try:
-            r2 = requests.get("https://api.coingecko.com/api/v3/simple/price", params={"ids":"bitcoin","vs_currencies":"usd"}, timeout=5)
+            r2 = session.get("https://api.coingecko.com/api/v3/simple/price", params={"ids":"bitcoin","vs_currencies":"usd"}, timeout=5)
             r2.raise_for_status()
             return float(r2.json()["bitcoin"]["usd"])
         except Exception:
             raise
 
 def fetch_binance_24h(symbol="BTCUSDT"):
+    session = _make_requests_session(retries=2, backoff_factor=0.2)
     try:
-        r = requests.get(BINANCE_24H, params={"symbol":symbol}, timeout=5)
+        r = session.get(BINANCE_24H, params={"symbol":symbol}, timeout=5)
         r.raise_for_status()
         d = r.json()
         return {"price_change":float(d.get("priceChange",0.0)), "price_change_percent":float(d.get("priceChangePercent",0.0)), "high_price":float(d.get("highPrice",0.0)), "low_price":float(d.get("lowPrice",0.0)), "volume":float(d.get("volume",0.0))}
@@ -667,7 +711,7 @@ if st.button("Predict (use trained models)"):
                     kp = {"date": datetime.utcnow(), "ticker": "BTCUSDT", "24h_change": b24["price_change"], "24h_change_pct": b24["price_change_percent"], "high": b24["high_price"], "low": b24["low_price"], "volume": b24["volume"]}
 
                 keybox.markdown(f"""
-                    <div style="background-color:#f3f9ff;padding:12px;border-radius:10px;border-left:5px solid #1177cc;margin-bottom:8px;">
+                    <div style="background-color:#000000;color:#ffffff;padding:12px;border-radius:10px;border-left:5px solid #ffffff;margin-bottom:8px;">
                         <h4 style="margin-top:0;">📌 Key Points — {kp.get('ticker','')} (latest)</h4>
                         <ul style="font-size:14px;">
                             <li><b>Last date:</b> {kp.get('date')}</li>
