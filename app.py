@@ -7,6 +7,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 import time
 import math
+import os
 import warnings
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV, train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -49,11 +50,6 @@ except Exception:
 # small helper plotting functions
 # ---------------------------
 def plot_series(plot_placeholder, x, y, preds_dict=None, title=""):
-    """
-    x: list of datetimes or indexes
-    y: list of floats (actual close)
-    preds_dict: {"XGB": (pred_value, pred_time), "RF": (...), ...}
-    """
     try:
         if HAVE_MPL:
             fig, ax = plt.subplots(figsize=(10,4))
@@ -76,7 +72,6 @@ def plot_series(plot_placeholder, x, y, preds_dict=None, title=""):
             fig.update_layout(title=title, xaxis_title="time", yaxis_title="price", height=420)
             plot_placeholder.plotly_chart(fig)
         else:
-            # fallback
             s = pd.Series(y, index=x)
             plot_placeholder.line_chart(s)
             if preds_dict:
@@ -103,21 +98,20 @@ def plot_feature_importances(plot_placeholder, feat_names, importances):
         plot_placeholder.text(f"Feature importance error: {e}")
 
 # ---------------------------
-# endpoints + resilient fetcher (Binance + CoinGecko fallback)
+# endpoints + resilient fetcher (Binance primary + CoinGecko fallback)
 # ---------------------------
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 BINANCE_PRICE = "https://api.binance.com/api/v3/ticker/price"
 BINANCE_24H = "https://api.binance.com/api/v3/ticker/24hr"
 COINGECKO_RANGE = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range"
+COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
+
+# local cache path (change if you want)
+CACHE_PATH = os.path.join(os.getcwd(), "data_cache.csv")
 
 from requests.adapters import HTTPAdapter, Retry
 
 def _make_requests_session(retries=3, backoff_factor=0.3, status_forcelist=(429,500,502,503,504)):
-    """
-    Create a requests.Session with Retry configured.
-    NOTE: intentionally exclude 451 from retry list so we don't keep retrying
-    'Unavailable For Legal Reasons' responses — those should immediately fall back.
-    """
     s = requests.Session()
     retry = Retry(
         total=retries,
@@ -128,7 +122,6 @@ def _make_requests_session(retries=3, backoff_factor=0.3, status_forcelist=(429,
     adapter = HTTPAdapter(max_retries=retry)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
-    # set a sensible user agent so some providers don't block us
     s.headers.update({"User-Agent": "real-time-btc-predictor/1.0 (+https://example.com)"})
     return s
 
@@ -137,199 +130,231 @@ def now_ms():
 def ms_to_s(ms):
     return int(ms / 1000)
 
-# Rate-limit aware CoinGecko fetcher (retries, respects Retry-After)
-def fetch_klines_coingecko(symbol="BTCUSDT", interval="1m", start_time_ms=None, end_time_ms=None, max_attempts=5):
+# ---------------------------
+# Cache helpers
+# ---------------------------
+def ensure_cache_exists(path=CACHE_PATH):
+    if not os.path.exists(path):
+        df = pd.DataFrame(columns=["Date","Open","High","Low","Close","Volume","source"])
+        df.to_csv(path, index=False)
+
+def append_rows_to_cache(df_rows: pd.DataFrame, path=CACHE_PATH):
     """
-    Rate-limit-aware CoinGecko range fetcher (uses a requests.Session).
-    - Exits immediately on HTTP 451 (legal block) and returns empty DF so the app can use other fallbacks.
-    - Retries on 429 respecting Retry-After header.
-    - Caps backoff wait to avoid extremely long sleeps.
+    df_rows: DataFrame with columns Date (datetime-like), Open, High, Low, Close, Volume, source
+    Appends rows and deduplicates by Date (keeps latest).
     """
-    session = _make_requests_session(retries=3, backoff_factor=0.5)
+    if df_rows is None or df_rows.empty:
+        return
+    ensure_cache_exists(path)
+    try:
+        # Normalize Date column to pandas datetime and round to seconds for dedupe
+        df_rows = df_rows.copy()
+        df_rows["Date"] = pd.to_datetime(df_rows["Date"])
+        df_rows = df_rows[["Date","Open","High","Low","Close","Volume","source"]]
+
+        existing = pd.read_csv(path, parse_dates=["Date"])
+        if not existing.empty:
+            combined = pd.concat([existing, df_rows], ignore_index=True)
+        else:
+            combined = df_rows
+        # drop duplicates keeping last occurrence
+        combined = combined.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+        combined.to_csv(path, index=False)
+    except Exception as e:
+        st.warning(f"Failed to append to cache: {e}")
+
+def load_cached_data(path=CACHE_PATH, tail_n=None):
+    """
+    Returns cached DataFrame sorted by Date ascending. If tail_n provided, returns last tail_n rows.
+    """
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, parse_dates=["Date"])
+        df = df.sort_values("Date").reset_index(drop=True)
+        if tail_n:
+            return df.tail(tail_n).reset_index(drop=True)
+        return df
+    except Exception as e:
+        st.warning(f"Failed to read cache file: {e}")
+        return pd.DataFrame()
+
+# ---------------------------
+# CoinGecko fetcher (fallback only)
+# ---------------------------
+def fetch_klines_coingecko(symbol="BTCUSDT", interval="1m", start_time_ms=None, end_time_ms=None, max_attempts=3):
+    session = _make_requests_session(retries=1, backoff_factor=0.5)
     now = now_ms()
     if end_time_ms is None:
         end_time_ms = now
     end_s = ms_to_s(min(end_time_ms, now))
     if start_time_ms is None:
-        start_s = end_s - 7*24*3600  # 7 days default
+        start_s = end_s - 7*24*3600
     else:
         start_s = ms_to_s(start_time_ms)
 
     url = COINGECKO_RANGE
-    params = {"vs_currency": "usd", "from": int(start_s), "to": int(end_s)}
+    params = {"vs_currency":"usd", "from":int(start_s), "to":int(end_s)}
     attempt = 0
     backoff = 1.0
-    MAX_BACKOFF = 8.0  # cap backoff so sleeps don't grow unbounded
+    MAX_BACKOFF = 6.0
 
     while attempt < max_attempts:
         attempt += 1
         try:
-            r = session.get(url, params=params, timeout=20)
-            # If CoinGecko returns 451 -> legal block, don't retry, fall back immediately
+            r = session.get(url, params=params, timeout=15)
             if r.status_code == 451:
-                st.warning(f"CoinGecko returned HTTP 451 (unavailable for legal reasons). Not retrying; falling back (attempt {attempt}/{max_attempts}).")
-                df_empty = pd.DataFrame(columns=["open_time","open","high","low","close","volume"])
-                df_empty._source = "coingecko"
-                return df_empty
-
+                st.warning("CoinGecko returned HTTP 451 (unavailable). CoinGecko fallback aborted.")
+                return pd.DataFrame()
             if r.status_code == 429:
-                # Rate limited: honor Retry-After if present, else small backoff
                 ra = r.headers.get("Retry-After")
-                if ra:
-                    try:
-                        wait = min(float(ra), MAX_BACKOFF)
-                    except Exception:
-                        wait = min(backoff, MAX_BACKOFF)
-                else:
-                    wait = min(backoff, MAX_BACKOFF)
-                st.warning(f"CoinGecko 429 rate limit. Sleeping {wait:.1f}s (attempt {attempt}/{max_attempts})")
+                wait = min(float(ra) if ra else backoff, MAX_BACKOFF)
+                st.warning(f"CoinGecko 429, sleeping {wait:.1f}s (attempt {attempt}/{max_attempts})")
                 time.sleep(wait)
                 backoff = min(backoff * 2.0, MAX_BACKOFF)
                 continue
-
-            # For other non-200 statuses, treat as hard failure and return empty to trigger Binance fallback upstream
             if r.status_code != 200:
-                try:
-                    msg = r.json()
-                except Exception:
-                    msg = r.text[:400]
-                st.warning(f"CoinGecko request failed (status {r.status_code}). Server message: {msg}")
-                df_empty = pd.DataFrame(columns=["open_time","open","high","low","close","volume"])
-                df_empty._source = "coingecko"
-                return df_empty
+                st.warning(f"CoinGecko returned {r.status_code}. Aborting this fallback attempt.")
+                return pd.DataFrame()
 
             j = r.json()
             prices = j.get("prices", [])
             volumes = j.get("total_volumes", [])
             if not prices:
-                df_empty = pd.DataFrame(columns=["open_time","open","high","low","close","volume"])
-                df_empty._source = "coingecko"
-                return df_empty
+                return pd.DataFrame()
 
             dfp = pd.DataFrame(prices, columns=["ts_ms","price"])
             dfv = pd.DataFrame(volumes, columns=["ts_ms","volume"]) if volumes else None
-            dfp["open_time"] = pd.to_datetime(dfp["ts_ms"], unit="ms")
-            dfp["open"] = dfp["price"]; dfp["high"] = dfp["price"]; dfp["low"] = dfp["price"]; dfp["close"] = dfp["price"]
+            dfp["Date"] = pd.to_datetime(dfp["ts_ms"], unit="ms")
+            dfp["Open"] = dfp["price"]; dfp["High"]=dfp["price"]; dfp["Low"]=dfp["price"]; dfp["Close"]=dfp["price"]
             if dfv is not None and not dfv.empty:
                 df = pd.merge_asof(dfp.sort_values("ts_ms"), dfv.sort_values("ts_ms"), on="ts_ms", direction="nearest")
-                df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+                df["Volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
             else:
                 df = dfp
-                df["volume"] = 0.0
-            df = df[["open_time","open","high","low","close","volume"]].reset_index(drop=True)
-            df._source = "coingecko"
+                df["Volume"] = 0.0
+            df = df[["Date","Open","High","Low","Close","Volume"]].reset_index(drop=True)
+            df["source"] = "coingecko"
+            # append to cache
+            append_rows_to_cache(df)
             return df
-
         except requests.RequestException as e:
-            # Network error — retry a few times, then return empty DF
-            st.warning(f"CoinGecko network error on attempt {attempt}: {e}. Sleeping {min(backoff, MAX_BACKOFF):.1f}s before retry.")
-            time.sleep(min(backoff, MAX_BACKOFF))
+            st.warning(f"CoinGecko network error on attempt {attempt}: {e}. Sleeping {min(backoff,MAX_BACKOFF):.1f}s")
+            time.sleep(min(backoff,MAX_BACKOFF))
             backoff = min(backoff * 2.0, MAX_BACKOFF)
             continue
         except Exception as e:
-            st.error(f"Unexpected CoinGecko parsing error: {e}")
-            df_err = pd.DataFrame(columns=["open_time","open","high","low","close","volume"])
-            df_err._source = "coingecko"
-            return df_err
+            st.error(f"CoinGecko parsing error: {e}")
+            return pd.DataFrame()
 
-    # exhausted attempts
-    st.warning("CoinGecko fallback exhausted retries. Returning empty DataFrame so other fallbacks can be used.")
-    df_empty = pd.DataFrame(columns=["open_time","open","high","low","close","volume"])
-    df_empty._source = "coingecko"
-    return df_empty
+    st.warning("CoinGecko fallback exhausted.")
+    return pd.DataFrame()
 
-# Robust Binance klines fetcher with fallback
-def fetch_klines_resilient(symbol="BTCUSDT", interval="1m", limit=500, start_time_ms=None, end_time_ms=None, days=None):
+# ---------------------------
+# Binance-first fetcher with persistent local caching
+# ---------------------------
+def fetch_klines_resilient(symbol="BTCUSDT", interval="1m", limit=500, start_time_ms=None, end_time_ms=None, days=None, use_cache_as_fallback=True):
     """
-    Binance-first fetcher with effectively unlimited retries on transient errors.
-    - Retries Binance indefinitely (capped backoff).
-    - Falls back to CoinGecko only on 'hard' failures (451 or non-retriable 4xx).
-    - Keeps behavior for paginated historical requests, but each request to Binance will loop until success or hard failure.
+    Primary: Binance (retry loop until success or hard client error like 451), fallback: CoinGecko, then local cache.
+    On any successful fetch, data appended to local cache.
     """
-    binance_session = _make_requests_session(retries=3, backoff_factor=0.4)  # session config; retry won't be infinite here — we use explicit loops
+    session = _make_requests_session(retries=2, backoff_factor=0.3)
     now = now_ms()
     if end_time_ms is None:
         end_time_ms = now
     else:
         end_time_ms = min(end_time_ms, now)
-
     if start_time_ms is None:
         if days:
             start_time_ms = end_time_ms - int(days * 24 * 3600 * 1000)
         else:
             start_time_ms = None
 
-    # Helper to perform a GET to Binance with unlimited-ish retry loop (bounded backoff)
-    def _binance_get_with_retries(url, params, timeout=15):
+    # Helper: call Binance with internal unlimited-ish retry for transient errors
+    def _binance_get(url, params, timeout=15):
         attempt = 0
         backoff = 0.5
         MAX_BACKOFF = 8.0
         while True:
             attempt += 1
             try:
-                r = binance_session.get(url, params=params, timeout=timeout)
+                r = session.get(url, params=params, timeout=timeout)
             except requests.RequestException as e:
-                # network/connection error -> retry
-                st.warning(f"Binance network error (attempt {attempt}): {e}. Sleeping {min(backoff,MAX_BACKOFF):.1f}s then retrying.")
-                time.sleep(min(backoff, MAX_BACKOFF))
+                st.warning(f"Binance network error (attempt {attempt}): {e}. Sleeping {min(backoff,MAX_BACKOFF):.1f}s then retry.")
+                time.sleep(min(backoff,MAX_BACKOFF))
                 backoff = min(backoff * 2.0, MAX_BACKOFF)
                 continue
 
-            # If Binance explicitly returns 451 (legal block) -> treat as hard failure (fall back to CoinGecko)
-            if r.status_code == 451:
-                st.warning(f"Binance returned HTTP 451 (unavailable for legal reasons). Falling back to CoinGecko.")
-                return r  # caller will handle fallback
+            # Hard client error -> return response so caller can fall back
+            if r.status_code == 451 or (400 <= r.status_code < 500 and r.status_code not in (429,408)):
+                return r
 
-            # Rate-limited -> honor Retry-After if present, else backoff and retry
+            # Rate limit -> honor Retry-After or backoff
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 try:
                     wait = float(ra) if ra else min(backoff, MAX_BACKOFF)
                 except Exception:
                     wait = min(backoff, MAX_BACKOFF)
-                st.warning(f"Binance 429 rate limit. Sleeping {wait:.1f}s (attempt {attempt})")
+                st.warning(f"Binance 429 rate limit. Sleeping {wait:.1f}s (attempt {attempt}).")
                 time.sleep(wait)
                 backoff = min(backoff * 2.0, MAX_BACKOFF)
                 continue
 
-            # Other 4xx (client) errors except 408 we treat as hard failures and fall back
-            if 400 <= r.status_code < 500 and r.status_code not in (429, 408):
-                st.warning(f"Binance returned client error {r.status_code}. Falling back to CoinGecko. Server msg: {r.text[:300]}")
-                return r
-
-            # 5xx or 3xx etc -> transient: wait and retry
-            if r.status_code >= 500 or r.status_code == 0:
-                st.warning(f"Binance server error {r.status_code}. Sleeping {min(backoff,MAX_BACKOFF):.1f}s then retrying (attempt {attempt}).")
-                time.sleep(min(backoff, MAX_BACKOFF))
+            # Server error -> backoff & retry
+            if r.status_code >= 500:
+                st.warning(f"Binance server error {r.status_code}. Sleeping {min(backoff,MAX_BACKOFF):.1f}s then retry.")
+                time.sleep(min(backoff,MAX_BACKOFF))
                 backoff = min(backoff * 2.0, MAX_BACKOFF)
                 continue
 
-            # Success or other statuses
+            # success or unexpected status (e.g. 200)
             return r
 
-    # If no time range: request most recent 'limit' candles
+    # If no range specified: recent candles
     if start_time_ms is None:
         params = {"symbol": symbol, "interval": interval, "limit": limit}
-        r = _binance_get_with_retries(BINANCE_KLINES, params, timeout=15)
-        # If r is client error or 451 -> fallback to CoinGecko
+        r = _binance_get(BINANCE_KLINES, params, timeout=15)
         if r is None or r.status_code != 200:
-            st.warning("Binance recent klines not available or returned non-200. Falling back to CoinGecko.")
-            return fetch_klines_coingecko(symbol=symbol, interval=interval, start_time_ms=(now - 7*24*3600*1000), end_time_ms=now)
+            st.warning("Binance recent klines unavailable; attempting CoinGecko fallback, then local cache.")
+            df_cg = fetch_klines_coingecko(symbol=symbol, interval=interval, start_time_ms=(now - 7*24*3600*1000), end_time_ms=now)
+            if df_cg is not None and not df_cg.empty:
+                return df_cg
+            # last resort: local cache
+            if use_cache_as_fallback:
+                cached = load_cached_data(tail_n=limit)
+                if not cached.empty:
+                    st.warning("Using local cache as fallback for recent klines.")
+                    return cached.rename(columns={"Date":"open_time","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}).rename_axis(None)
+            return pd.DataFrame()
 
         try:
             data = r.json()
             df = pd.DataFrame(data, columns=["open_time","open","high","low","close","volume","close_time","qav","num_trades","taker_base","taker_quote","ignore"])
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df["Date"] = pd.to_datetime(df["open_time"], unit="ms")
             for c in ["open","high","low","close","volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-            df = df[["open_time","open","high","low","close","volume"]].reset_index(drop=True)
-            df._source = "binance"
-            return df
+            out = df[["Date","open","high","low","close","volume"]].rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+            out["source"] = "binance"
+            append_rows_to_cache(out[["Date","Open","High","Low","Close","Volume","source"]])
+            # return in original structure for rest of app
+            out2 = out.rename(columns={"Date":"open_time","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+            out2 = out2[["open_time","open","high","low","close","volume"]]
+            out2._source = "binance"
+            return out2
         except Exception as e:
-            st.warning(f"Failed parsing Binance recent klines JSON: {e}. Falling back to CoinGecko.")
-            return fetch_klines_coingecko(symbol=symbol, interval=interval, start_time_ms=(now - 7*24*3600*1000), end_time_ms=now)
+            st.warning(f"Failed parsing Binance recent klines: {e}. Trying fallback.")
+            df_cg = fetch_klines_coingecko(symbol=symbol, interval=interval, start_time_ms=(now - 7*24*3600*1000), end_time_ms=now)
+            if df_cg is not None and not df_cg.empty:
+                return df_cg
+            if use_cache_as_fallback:
+                cached = load_cached_data(tail_n=limit)
+                if not cached.empty:
+                    st.warning("Using local cache as fallback for recent klines.")
+                    return cached.rename(columns={"Date":"open_time","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+            return pd.DataFrame()
 
-    # Paginated historical fetch — each page uses the same retry-get helper
+    # Historical paginated fetch
     all_rows = []
     fetch_start = int(start_time_ms)
     interval_map = {"1m":60_000,"3m":3*60_000,"5m":5*60_000,"15m":15*60_000,"30m":30*60_000,"1h":60*60*1000,"1d":24*60*60*1000}
@@ -338,18 +363,36 @@ def fetch_klines_resilient(symbol="BTCUSDT", interval="1m", limit=500, start_tim
 
     while True:
         params = {"symbol": symbol, "interval": interval, "limit": MAX_LIMIT, "startTime": int(fetch_start), "endTime": int(end_time_ms)}
-        r = _binance_get_with_retries(BINANCE_KLINES, params, timeout=20)
-
-        # If Binance returned a non-200 that we decided is a hard failure, fall back
+        r = _binance_get(BINANCE_KLINES, params, timeout=20)
         if r is None or r.status_code != 200:
-            st.warning("Binance historical klines failed or returned non-200. Falling back to CoinGecko.")
-            return fetch_klines_coingecko(symbol=symbol, interval=interval, start_time_ms=start_time_ms, end_time_ms=end_time_ms)
+            st.warning("Binance historical fetch failed; trying CoinGecko then local cache.")
+            df_cg = fetch_klines_coingecko(symbol=symbol, interval=interval, start_time_ms=start_time_ms, end_time_ms=end_time_ms)
+            if df_cg is not None and not df_cg.empty:
+                return df_cg
+            if use_cache_as_fallback:
+                cached = load_cached_data()
+                if not cached.empty:
+                    st.warning("Using local cache as fallback for historical klines.")
+                    # filter by requested window if start_time_ms provided
+                    if start_time_ms:
+                        start_dt = pd.to_datetime(ms_to_s(start_time_ms), unit="s")
+                        cached = cached[cached["Date"] >= start_dt]
+                    return cached.rename(columns={"Date":"open_time","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+            return pd.DataFrame()
 
         try:
             data = r.json()
         except Exception:
-            st.warning("Failed to parse Binance klines JSON. Falling back to CoinGecko.")
-            return fetch_klines_coingecko(symbol=symbol, interval=interval, start_time_ms=start_time_ms, end_time_ms=end_time_ms)
+            st.warning("Failed to parse Binance historical JSON. Trying fallback.")
+            df_cg = fetch_klines_coingecko(symbol=symbol, interval=interval, start_time_ms=start_time_ms, end_time_ms=end_time_ms)
+            if df_cg is not None and not df_cg.empty:
+                return df_cg
+            if use_cache_as_fallback:
+                cached = load_cached_data()
+                if not cached.empty:
+                    st.warning("Using local cache as fallback for historical klines.")
+                    return cached.rename(columns={"Date":"open_time","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+            return pd.DataFrame()
 
         if not data:
             break
@@ -363,158 +406,164 @@ def fetch_klines_resilient(symbol="BTCUSDT", interval="1m", limit=500, start_tim
         time.sleep(0.12)
 
     if not all_rows:
-        df_empty = pd.DataFrame(columns=["open_time","open","high","low","close","volume"])
-        df_empty._source = "binance"
-        return df_empty
+        return pd.DataFrame()
 
     df = pd.DataFrame(all_rows, columns=["open_time","open","high","low","close","volume","close_time","qav","num_trades","taker_base","taker_quote","ignore"])
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df["Date"] = pd.to_datetime(df["open_time"], unit="ms")
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df[["open_time","open","high","low","close","volume"]].reset_index(drop=True)
-    df._source = "binance"
-    return df
+    out = df[["Date","open","high","low","close","volume"]].rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+    out["source"] = "binance"
+    append_rows_to_cache(out[["Date","Open","High","Low","Close","Volume","source"]])
+    out2 = out.rename(columns={"Date":"open_time","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+    out2 = out2[["open_time","open","high","low","close","volume"]]
+    out2._source = "binance"
+    return out2
 
+# ---------------------------
+# Price & 24h fetchers that append to cache when successful
+# ---------------------------
 def fetch_current_price(symbol="BTCUSDT"):
-    """
-    Try Binance indefinitely (capped backoff). Use CoinGecko only as fallback on hard failures.
-    """
-    session = _make_requests_session(retries=2, backoff_factor=0.2)
+    session = _make_requests_session(retries=1, backoff_factor=0.2)
     attempt = 0
     backoff = 0.5
-    MAX_BACKOFF = 8.0
-    url = BINANCE_PRICE
-    params = {"symbol": symbol}
+    MAX_BACKOFF = 6.0
     while True:
         attempt += 1
         try:
-            r = session.get(url, params=params, timeout=5)
+            r = session.get(BINANCE_PRICE, params={"symbol":symbol}, timeout=6)
         except requests.RequestException as e:
-            st.warning(f"Binance price network error (attempt {attempt}): {e}. Sleeping {min(backoff,MAX_BACKOFF):.1f}s then retrying.")
-            time.sleep(min(backoff, MAX_BACKOFF))
+            st.warning(f"Binance price network error (attempt {attempt}): {e}. Sleeping {min(backoff,MAX_BACKOFF):.1f}s then retry.")
+            time.sleep(min(backoff,MAX_BACKOFF))
             backoff = min(backoff * 2.0, MAX_BACKOFF)
             continue
 
-        if r.status_code == 451:
-            st.warning("Binance price returned HTTP 451. Falling back to CoinGecko.")
+        if r.status_code == 200:
+            try:
+                price = float(r.json()["price"])
+                # append to cache as a small 1-row DataFrame
+                now_dt = datetime.utcnow()
+                df_row = pd.DataFrame([{
+                    "Date": now_dt,
+                    "Open": price,
+                    "High": price,
+                    "Low": price,
+                    "Close": price,
+                    "Volume": 0.0,
+                    "source": "binance_tick"
+                }])
+                append_rows_to_cache(df_row)
+                return price
+            except Exception:
+                st.warning("Binance price parse failed; trying fallback.")
+                break
+
+        # handle client errors -> fallback
+        if r.status_code == 451 or (400 <= r.status_code < 500 and r.status_code not in (429, 408)):
+            st.warning(f"Binance price returned {r.status_code}. Falling back to CoinGecko and/or local cache.")
             break
 
         if r.status_code == 429:
             ra = r.headers.get("Retry-After")
-            try:
-                wait = float(ra) if ra else min(backoff, MAX_BACKOFF)
-            except Exception:
-                wait = min(backoff, MAX_BACKOFF)
-            st.warning(f"Binance price 429. Sleeping {wait:.1f}s.")
+            wait = min(float(ra) if ra else backoff, MAX_BACKOFF)
+            st.warning(f"Binance price 429; sleeping {wait:.1f}s.")
             time.sleep(wait)
             backoff = min(backoff * 2.0, MAX_BACKOFF)
             continue
 
-        if 400 <= r.status_code < 500 and r.status_code not in (429, 408):
-            st.warning(f"Binance price returned client error {r.status_code}. Falling back to CoinGecko.")
-            break
-
         if r.status_code >= 500:
-            st.warning(f"Binance price returned server error {r.status_code}. Sleeping {min(backoff,MAX_BACKOFF):.1f}s then retrying.")
-            time.sleep(min(backoff, MAX_BACKOFF))
+            st.warning(f"Binance price server error {r.status_code}. Sleeping then retrying.")
+            time.sleep(min(backoff,MAX_BACKOFF))
             backoff = min(backoff * 2.0, MAX_BACKOFF)
             continue
-
-        try:
-            r.raise_for_status()
-            return float(r.json()["price"])
-        except Exception:
-            st.warning("Failed parsing Binance price JSON; falling back to CoinGecko.")
-            break
 
     # CoinGecko fallback
     try:
-        r2 = requests.get("https://api.coingecko.com/api/v3/simple/price", params={"ids":"bitcoin","vs_currencies":"usd"}, timeout=5)
+        r2 = requests.get(COINGECKO_SIMPLE, params={"ids":"bitcoin","vs_currencies":"usd"}, timeout=6)
         r2.raise_for_status()
-        return float(r2.json()["bitcoin"]["usd"])
-    except Exception as e:
-        st.error(f"Both Binance and CoinGecko failed to provide current price: {e}")
-        raise
+        price = float(r2.json()["bitcoin"]["usd"])
+        now_dt = datetime.utcnow()
+        df_row = pd.DataFrame([{
+            "Date": now_dt,
+            "Open": price,
+            "High": price,
+            "Low": price,
+            "Close": price,
+            "Volume": 0.0,
+            "source": "coingecko_tick"
+        }])
+        append_rows_to_cache(df_row)
+        return price
+    except Exception:
+        # local cache fallback: return last Close if available
+        cached = load_cached_data()
+        if not cached.empty:
+            last_close = float(cached["Close"].iloc[-1])
+            st.warning("Returning last cached close as price fallback.")
+            return last_close
+        raise RuntimeError("Failed to obtain current price from Binance, CoinGecko, and local cache.")
 
 def fetch_binance_24h(symbol="BTCUSDT"):
-    """
-    Try Binance indefinitely (capped backoff) to get 24h stats. Use CoinGecko only as a fallback.
-    """
-    session = _make_requests_session(retries=2, backoff_factor=0.2)
+    session = _make_requests_session(retries=1, backoff_factor=0.2)
     attempt = 0
     backoff = 0.5
-    MAX_BACKOFF = 8.0
-    url = BINANCE_24H
-    params = {"symbol": symbol}
+    MAX_BACKOFF = 6.0
     while True:
         attempt += 1
         try:
-            r = session.get(url, params=params, timeout=5)
+            r = session.get(BINANCE_24H, params={"symbol":symbol}, timeout=6)
         except requests.RequestException as e:
-            st.warning(f"Binance 24h network error (attempt {attempt}): {e}. Sleeping {min(backoff,MAX_BACKOFF):.1f}s then retrying.")
-            time.sleep(min(backoff, MAX_BACKOFF))
+            st.warning(f"Binance 24h network error (attempt {attempt}): {e}. Sleeping then retry.")
+            time.sleep(min(backoff,MAX_BACKOFF))
             backoff = min(backoff * 2.0, MAX_BACKOFF)
             continue
 
-        if r.status_code == 451:
-            st.warning("Binance 24h returned HTTP 451. Falling back to CoinGecko.")
+        if r.status_code == 200:
+            try:
+                d = r.json()
+                res = {"price_change":float(d.get("priceChange",0.0)), "price_change_percent":float(d.get("priceChangePercent",0.0)), "high_price":float(d.get("highPrice",0.0)), "low_price":float(d.get("lowPrice",0.0)), "volume":float(d.get("volume",0.0))}
+                return res
+            except Exception:
+                st.warning("Binance 24h parse failed; falling back.")
+                break
+
+        if r.status_code == 451 or (400 <= r.status_code < 500 and r.status_code not in (429, 408)):
+            st.warning(f"Binance 24h returned {r.status_code}. Falling back to CoinGecko/local cache.")
             break
 
         if r.status_code == 429:
             ra = r.headers.get("Retry-After")
-            try:
-                wait = float(ra) if ra else min(backoff, MAX_BACKOFF)
-            except Exception:
-                wait = min(backoff, MAX_BACKOFF)
-            st.warning(f"Binance 24h 429. Sleeping {wait:.1f}s.")
+            wait = min(float(ra) if ra else backoff, MAX_BACKOFF)
+            st.warning(f"Binance 24h 429; sleeping {wait:.1f}s.")
             time.sleep(wait)
             backoff = min(backoff * 2.0, MAX_BACKOFF)
             continue
 
-        if 400 <= r.status_code < 500 and r.status_code not in (429, 408):
-            st.warning(f"Binance 24h returned client error {r.status_code}. Falling back to CoinGecko.")
-            break
-
         if r.status_code >= 500:
-            st.warning(f"Binance 24h returned server error {r.status_code}. Sleeping {min(backoff,MAX_BACKOFF):.1f}s then retrying.")
-            time.sleep(min(backoff, MAX_BACKOFF))
+            st.warning(f"Binance 24h server error {r.status_code}. Sleeping then retry.")
+            time.sleep(min(backoff,MAX_BACKOFF))
             backoff = min(backoff * 2.0, MAX_BACKOFF)
             continue
 
-        try:
-            r.raise_for_status()
-            d = r.json()
-            return {
-                "price_change": float(d.get("priceChange", 0.0)),
-                "price_change_percent": float(d.get("priceChangePercent", 0.0)),
-                "high_price": float(d.get("highPrice", 0.0)),
-                "low_price": float(d.get("lowPrice", 0.0)),
-                "volume": float(d.get("volume", 0.0))
-            }
-        except Exception:
-            st.warning("Failed parsing Binance 24h JSON; falling back to CoinGecko.")
-            break
-
-    # fallback to CoinGecko klines
+    # fallback to CoinGecko klines then cache
     try:
         end = now_ms(); start = end - 2*24*3600*1000
         cg = fetch_klines_coingecko(start_time_ms=start, end_time_ms=end)
-        if cg.empty:
-            raise RuntimeError("CoinGecko fallback returned empty")
-        first = float(cg["close"].iloc[0]); last = float(cg["close"].iloc[-1])
-        return {
-            "price_change": last - first,
-            "price_change_percent": ((last-first)/first)*100.0 if first != 0 else 0.0,
-            "high_price": float(cg["high"].max()),
-            "low_price": float(cg["low"].min()),
-            "volume": float(cg["volume"].sum())
-        }
-    except Exception as e:
-        st.warning(f"Both Binance and CoinGecko failed for 24h stats: {e}")
-        return {"price_change":0.0,"price_change_percent":0.0,"high_price":0.0,"low_price":0.0,"volume":0.0}
+        if cg is not None and not cg.empty:
+            first = float(cg["Close"].iloc[0]); last = float(cg["Close"].iloc[-1])
+            return {"price_change": last-first, "price_change_percent": ((last-first)/first)*100.0 if first!=0 else 0.0, "high_price":float(cg["High"].max()), "low_price":float(cg["Low"].min()), "volume":float(cg["Volume"].sum())}
+    except Exception:
+        pass
+
+    # local cache as last resort
+    cached = load_cached_data()
+    if not cached.empty:
+        first = float(cached["Close"].iloc[0]); last = float(cached["Close"].iloc[-1])
+        return {"price_change": last-first, "price_change_percent": ((last-first)/first)*100.0 if first!=0 else 0.0, "high_price":float(cached["High"].max()), "low_price":float(cached["Low"].min()), "volume":float(cached["Volume"].sum())}
+    return {"price_change":0.0,"price_change_percent":0.0,"high_price":0.0,"low_price":0.0,"volume":0.0}
 
 # ---------------------------
-# indicators & feature builders
+# indicators & feature builders (unchanged)
 # ---------------------------
 USE_PANDAS_TA = False
 try:
@@ -582,7 +631,7 @@ def build_features_from_df(df, n_lags=10, use_extra_cols=True):
     return X, y, X.columns.tolist(), enriched_aligned
 
 # ---------------------------
-# Train helpers: XGB CV + other models
+# Train helpers (unchanged)
 # ---------------------------
 def train_xgb_with_cv(X, y, n_splits=4, n_iter_search=20, random_state=42):
     if X.shape[0] < 3:
@@ -616,14 +665,14 @@ def train_other_model(model_name, X_train, y_train):
     return None
 
 # ---------------------------
-# Streamlit UI
+# Streamlit UI (unchanged layout)
 # ---------------------------
 st.title("Real-time BTC Predictor — Ensemble of Models + Live Chart")
 
 left, right = st.columns([2,1])
 with left:
     uploaded = st.file_uploader("Upload CSV (optional). Must contain 'Close' column.", type=["csv","txt"])
-    st.markdown("If no CSV, app fetches live BTC (Binance/Coingecko fallback).")
+    st.markdown("If no CSV, app fetches live BTC (Binance/Coingecko fallback). Cached ticks are stored in `data_cache.csv`.")
     interval = st.selectbox("Interval for training (live)", ["1m","5m","15m","1h"], index=1)
     lookback = st.number_input("History rows for training", min_value=200, max_value=5000, value=1000, step=50)
     n_lags = st.slider("Lag features (n)", 1, 50, 12)
@@ -657,7 +706,7 @@ models_table_ph = st.empty()
 
 # session_state initialization
 if "models" not in st.session_state:
-    st.session_state["models"] = {}   # dict name->model
+    st.session_state["models"] = {}
 if "model_metrics" not in st.session_state:
     st.session_state["model_metrics"] = {}
 if "feat_names" not in st.session_state:
@@ -703,16 +752,23 @@ if train_btn:
         else:
             status.info("Fetching historical series for BTCUSDT...")
             df_live = fetch_klines_resilient(symbol="BTCUSDT", interval=interval, limit=int(lookback))
-            # detect source for debug
             if hasattr(df_live, "_source"):
                 status.info(f"Data source: {df_live._source}")
             if df_live is None or df_live.empty:
-                st.error("No historical data could be fetched from Binance or CoinGecko. Try increasing 'lookback', reduce interval, or try again later.")
-                status.info("Aborting training due to lack of data.")
-                st.stop()
-            if "open_time" in df_live.columns:
-                df_live = df_live.rename(columns={"open_time":"Date","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
-            df_use = df_live.reset_index(drop=True)
+                # try cached data
+                cached = load_cached_data(tail_n=lookback)
+                if not cached.empty:
+                    st.warning("Using cached data for training because live endpoints failed.")
+                    df_use = cached.rename(columns={"Date":"Date","Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}).reset_index(drop=True)
+                else:
+                    st.error("No historical data could be fetched from Binance/CoinGecko and cache is empty. Try increasing 'lookback', reduce interval, or try again later.")
+                    status.info("Aborting training due to lack of data.")
+                    st.stop()
+            else:
+                # normalize column names as earlier
+                if "open_time" in df_live.columns:
+                    df_live = df_live.rename(columns={"open_time":"Date","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+                df_use = df_live.reset_index(drop=True)
 
         # QUICK CHECK: ensure df_use has reasonable number of rows
         if df_use is None or df_use.empty or len(df_use) < (n_lags + 5):
@@ -725,13 +781,11 @@ if train_btn:
             st.error("After creating lag features there are zero rows. Reduce n_lags or provide more data.")
             st.stop()
 
-        # if X rows are fewer than n_splits+1, adjust n_splits down with a warning
         if X.shape[0] <= n_splits:
             old_n = n_splits
             n_splits = max(2, X.shape[0] - 1)
             st.warning(f"Reducing TimeSeriesSplit folds from {old_n} to {n_splits} because only {X.shape[0]} training rows are available.")
 
-        # If dataset is small, reduce tune_iters
         if X.shape[0] < 100 and tune_iters > 20:
             old_iter = tune_iters
             tune_iters = max(4, int(tune_iters * (X.shape[0] / 100.0)))
@@ -754,14 +808,12 @@ if train_btn:
         st.session_state["models"]["RF"] = rf_model
         st.session_state["model_metrics"]["RF"] = {"test_mae": float(mean_absolute_error(y_test, rf_model.predict(X_test)))}
 
-        # optional LightGBM
         if HAVE_LGB:
             status.info("Training LightGBM...")
             lgb_model = train_other_model("LGB", X_train, y_train)
             st.session_state["models"]["LGB"] = lgb_model
             st.session_state["model_metrics"]["LGB"] = {"test_mae": float(mean_absolute_error(y_test, lgb_model.predict(X_test)))}
 
-        # optional CatBoost
         if HAVE_CAT:
             status.info("Training CatBoost...")
             cat_model = train_other_model("CAT", X_train, y_train)
@@ -808,6 +860,15 @@ def append_current_tick():
         return t, p
     except Exception as e:
         st.warning(f"Tick fetch failed: {e}")
+        # still try to populate from cache last known
+        cached = load_cached_data()
+        if not cached.empty:
+            last = cached.iloc[-1]
+            t = pd.to_datetime(last["Date"])
+            p = float(last["Close"])
+            st.session_state["realtime"]["times"].append(t)
+            st.session_state["realtime"]["prices"].append(p)
+            return t, p
         return None, None
 
 # UI buttons actions
@@ -822,7 +883,7 @@ if start_live:
 if stop_live:
     st.session_state["live_running"] = False
 
-# Live loop (blocking) — not ideal for multi-user production but OK for prototype
+# Live loop (blocking)
 if st.session_state["live_running"]:
     status.info("Live mode running — press Stop Live to stop.")
     try:
@@ -855,11 +916,9 @@ if st.button("Predict (use trained models)"):
                         pv = float(model.predict(X_row)[0])
                     preds[name] = (pv, datetime.utcnow() + timedelta(seconds=5))
 
-                # ensemble (simple average)
                 ensemble_val = float(np.mean([v[0] for v in preds.values()]))
                 preds["Ensemble"] = (ensemble_val, datetime.utcnow() + timedelta(seconds=5))
 
-                # Key points
                 if using_csv:
                     last_row = df_src.iloc[-1]
                     prev_row = df_src.iloc[-2] if len(df_src)>=2 else None
@@ -888,16 +947,13 @@ if st.button("Predict (use trained models)"):
                     </div>
                 """, unsafe_allow_html=True)
 
-                # Show model predictions table
                 df_preds = pd.DataFrame([{ "model":k, "pred":v[0]} for k,v in preds.items()])
                 metrics_ph.dataframe(df_preds.set_index("model"))
 
-                # plot realtime data + model preds
                 times = st.session_state["realtime"]["times"] if st.session_state["realtime"]["times"] else (list(pd.to_datetime(df_src["Date"].iloc[-live_window:])) if "Date" in df_src.columns else list(range(len(df_src))))
                 prices = st.session_state["realtime"]["prices"] if st.session_state["realtime"]["prices"] else df_src["Close"].astype(float).tolist()[-len(times):]
                 plot_series(chart_ph, times, prices, preds_dict=preds, title="Real-time price with model predictions")
 
-                # feature importance for XGB if available
                 if "XGB" in st.session_state["models"]:
                     try:
                         imp = st.session_state["models"]["XGB"].feature_importances_
@@ -917,4 +973,4 @@ if st.session_state["realtime"]["times"]:
     plot_series(chart_ph, tlist, plist, title="Live price (buffer)")
 
 st.markdown("---")
-st.caption("Real-time chart + ensemble predictions. For production, consider converting the live loop into a non-blocking autorefresh with st_autorefresh or using Binance websockets for lower latency. This is educational — not financial advice.")
+st.caption("Real-time chart + ensemble predictions. Cached ticks saved to data_cache.csv. For production, use a proper DB or Binance websocket for robust low-latency data.")
